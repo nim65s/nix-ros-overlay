@@ -1,0 +1,898 @@
+From fa854d325ad4fa5f6e788d70b3ba9ccf9ee5c80f Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Alejandro=20Hern=C3=A1ndez=20Cordero?= <ahcorde@gmail.com>
+Date: Wed, 3 Jul 2024 10:55:32 +0200
+Subject: [PATCH 1/3] Support Qt6
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Alejandro Hernández Cordero <ahcorde@gmail.com>
+---
+ CMakeLists.txt              |   1 +
+ cmake/pyside_config.py      | 342 ++++++++++++++++++++++++++++++++++++
+ cmake/shiboken_helper.cmake | 148 +++++++++++++---
+ 3 files changed, 462 insertions(+), 29 deletions(-)
+ create mode 100755 cmake/pyside_config.py
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 919969e..e3ddec5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -11,6 +11,7 @@ install(FILES
+   cmake/shiboken_helper.cmake
+   cmake/sip_configure.py
+   cmake/sip_helper.cmake
++  cmake/pyside_config.py
+   DESTINATION share/${PROJECT_NAME}/cmake)
+ 
+ if(BUILD_TESTING)
+diff --git a/cmake/pyside_config.py b/cmake/pyside_config.py
+new file mode 100755
+index 0000000..73342fc
+--- /dev/null
++++ b/cmake/pyside_config.py
+@@ -0,0 +1,342 @@
++#!/usr/bin/python3
++# Copyright (C) 2022 The Qt Company Ltd.
++# SPDX-License-Identifier: LicenseRef-Qt-Commercial OR BSD-3-Clause
++
++import sysconfig
++from enum import Enum
++import glob
++import os
++import re
++import sys
++
++
++PYSIDE = 'pyside6'
++PYSIDE_MODULE = 'PySide6'
++SHIBOKEN = 'shiboken6'
++
++
++class Package(Enum):
++    SHIBOKEN_MODULE = 1
++    SHIBOKEN_GENERATOR = 2
++    PYSIDE_MODULE = 3
++
++
++generic_error = ('Did you forget to activate your virtualenv? Or perhaps'
++                 f' you forgot to build / install {PYSIDE_MODULE} into your currently active Python'
++                 ' environment?')
++pyside_error = f'Unable to locate {PYSIDE_MODULE}. {generic_error}'
++shiboken_module_error = f'Unable to locate {SHIBOKEN}-module. {generic_error}'
++shiboken_generator_error = f'Unable to locate shiboken-generator. {generic_error}'
++pyside_libs_error = f'Unable to locate the PySide shared libraries.  {generic_error}'
++python_link_error = 'Unable to locate the Python library for linking.'
++python_include_error = 'Unable to locate the Python include headers directory.'
++
++options = []
++
++# option, function, error, description
++options.append(("--shiboken-module-path",
++                lambda: find_shiboken_module(),
++                shiboken_module_error,
++                "Print shiboken module location"))
++options.append(("--shiboken-generator-path",
++                lambda: find_shiboken_generator(),
++                shiboken_generator_error,
++                "Print shiboken generator location"))
++options.append(("--pyside-path", lambda: find_pyside(), pyside_error,
++                f"Print {PYSIDE_MODULE} location"))
++
++options.append(("--python-include-path",
++                lambda: get_python_include_path(),
++                python_include_error,
++                "Print Python include path"))
++options.append(("--shiboken-generator-include-path",
++                lambda: get_package_include_path(Package.SHIBOKEN_GENERATOR),
++                pyside_error,
++                "Print shiboken generator include paths"))
++options.append(("--pyside-include-path",
++                lambda: get_package_include_path(Package.PYSIDE_MODULE),
++                pyside_error,
++                "Print PySide6 include paths"))
++
++options.append(("--python-link-flags-qmake", lambda: python_link_flags_qmake(), python_link_error,
++                "Print python link flags for qmake"))
++options.append(("--python-link-flags-cmake", lambda: python_link_flags_cmake(), python_link_error,
++                "Print python link flags for cmake"))
++
++options.append(("--shiboken-module-qmake-lflags",
++                lambda: get_package_qmake_lflags(Package.SHIBOKEN_MODULE), pyside_error,
++                "Print shiboken6 shared library link flags for qmake"))
++options.append(("--pyside-qmake-lflags",
++                lambda: get_package_qmake_lflags(Package.PYSIDE_MODULE), pyside_error,
++                "Print PySide6 shared library link flags for qmake"))
++
++options.append(("--shiboken-module-shared-libraries-qmake",
++                lambda: get_shared_libraries_qmake(Package.SHIBOKEN_MODULE), pyside_libs_error,
++                "Print paths of shiboken shared libraries (.so's, .dylib's, .dll's) for qmake"))
++options.append(("--shiboken-module-shared-libraries-cmake",
++                lambda: get_shared_libraries_cmake(Package.SHIBOKEN_MODULE), pyside_libs_error,
++                "Print paths of shiboken shared libraries (.so's, .dylib's, .dll's) for cmake"))
++
++options.append(("--pyside-shared-libraries-qmake",
++                lambda: get_shared_libraries_qmake(Package.PYSIDE_MODULE), pyside_libs_error,
++                "Print paths of f{PYSIDE_MODULE} shared libraries (.so's, .dylib's, .dll's) "
++                "for qmake"))
++options.append(("--pyside-shared-libraries-cmake",
++                lambda: get_shared_libraries_cmake(Package.PYSIDE_MODULE), pyside_libs_error,
++                f"Print paths of {PYSIDE_MODULE} shared libraries (.so's, .dylib's, .dll's) "
++                "for cmake"))
++
++options_usage = ''
++for i, (flag, _, _, description) in enumerate(options):
++    options_usage += f'    {flag:<45} {description}'
++    if i < len(options) - 1:
++        options_usage += '\n'
++
++usage = f"""
++Utility to determine include/link options of shiboken/PySide and Python for qmake/CMake projects
++that would like to embed or build custom shiboken/PySide bindings.
++
++Usage: pyside_config.py [option]
++Options:
++{options_usage}
++    -a                                            Print all options and their values
++    --help/-h                                     Print this help
++"""
++
++option = sys.argv[1] if len(sys.argv) == 2 else '-a'
++if option == '-h' or option == '--help':
++    print(usage)
++    sys.exit(0)
++
++
++def clean_path(path):
++    return path if sys.platform != 'win32' else path.replace('\\', '/')
++
++
++def shared_library_suffix():
++    if sys.platform == 'win32':
++        return 'lib'
++    elif sys.platform == 'darwin':
++        return 'dylib'
++    # Linux
++    else:
++        return 'so.*'
++
++
++def import_suffixes():
++    import importlib.machinery
++    return importlib.machinery.EXTENSION_SUFFIXES
++
++
++def is_debug():
++    debug_suffix = '_d.pyd' if sys.platform == 'win32' else '_d.so'
++    return any([s.endswith(debug_suffix) for s in import_suffixes()])
++
++
++def shared_library_glob_pattern():
++    glob = '*.' + shared_library_suffix()
++    return glob if sys.platform == 'win32' else 'lib' + glob
++
++
++def filter_shared_libraries(libs_list):
++    def predicate(lib_name):
++        basename = os.path.basename(lib_name)
++        if 'shiboken' in basename or 'pyside6' in basename:
++            return True
++        return False
++    result = [lib for lib in libs_list if predicate(lib)]
++    return result
++
++
++# Return qmake link option for a library file name
++def link_option(lib):
++    # On Linux:
++    # Since we cannot include symlinks with wheel packages
++    # we are using an absolute path for the libpyside and libshiboken
++    # libraries when compiling the project
++    baseName = os.path.basename(lib)
++    link = ' -l'
++    if sys.platform in ['linux', 'linux2']:  # Linux: 'libfoo.so' -> '/absolute/path/libfoo.so'
++        link = lib
++    elif sys.platform in ['darwin']:  # Darwin: 'libfoo.so' -> '-lfoo'
++        link += os.path.splitext(baseName[3:])[0]
++    else:  # Windows: 'libfoo.dll' -> 'libfoo.dll'
++        link += os.path.splitext(baseName)[0]
++    return link
++
++
++# Locate PySide6 via sys.path package path.
++def find_pyside():
++    return find_package_path(PYSIDE_MODULE)
++
++
++def find_shiboken_module():
++    return find_package_path(SHIBOKEN)
++
++
++def find_shiboken_generator():
++    return find_package_path(f"{SHIBOKEN}_generator")
++
++
++def find_package(which_package):
++    if which_package == Package.SHIBOKEN_MODULE:
++        return find_shiboken_module()
++    if which_package == Package.SHIBOKEN_GENERATOR:
++        return find_shiboken_generator()
++    if which_package == Package.PYSIDE_MODULE:
++        return find_pyside()
++    return None
++
++
++def find_package_path(dir_name):
++    for p in sys.path:
++        if 'site-' in p or 'dist-' in p:
++            package = os.path.join(p, dir_name)
++            if os.path.exists(package):
++                return clean_path(os.path.realpath(package))
++    return None
++
++
++# Return version as "x.y" (e.g. 3.9, 3.12, etc)
++def python_version():
++    return str(sys.version_info[0]) + '.' + str(sys.version_info[1])
++
++
++def get_python_include_path():
++    return sysconfig.get_path('include')
++
++
++def python_link_flags_qmake():
++    flags = python_link_data()
++    if sys.platform == 'win32':
++        libdir = flags['libdir']
++        # This will add the "~1" shortcut for directories that
++        # contain white spaces
++        # e.g.: "Program Files" to "Progra~1"
++        for d in libdir.split("\\"):
++            if " " in d:
++                libdir = libdir.replace(d, d.split(" ")[0][:-1] + "~1")
++        lib_flags = flags['lib']
++        return f'-L{libdir} -l{lib_flags}'
++    elif sys.platform == 'darwin':
++        libdir = flags['libdir']
++        lib_flags = flags['lib']
++        return f'-L{libdir} -l{lib_flags}'
++    else:
++        # Linux and anything else
++        libdir = flags['libdir']
++        lib_flags = flags['lib']
++        return f'-L{libdir} -l{lib_flags}'
++
++
++def python_link_flags_cmake():
++    flags = python_link_data()
++    libdir = flags['libdir']
++    lib = re.sub(r'.dll$', '.lib', flags['lib'])
++    return f'{libdir};{lib}'
++
++
++def python_link_data():
++    # @TODO Fix to work with static builds of Python
++    libdir = sysconfig.get_config_var('LIBDIR')
++    if libdir is None:
++        libdir = os.path.abspath(os.path.join(
++            sysconfig.get_config_var('LIBDEST'), "..", "libs"))
++    version = python_version()
++    version_no_dots = version.replace('.', '')
++
++    flags = {}
++    flags['libdir'] = libdir
++    if sys.platform == 'win32':
++        suffix = '_d' if is_debug() else ''
++        flags['lib'] = f'python{version_no_dots}{suffix}'
++
++    elif sys.platform == 'darwin':
++        flags['lib'] = f'python{version}'
++
++    # Linux and anything else
++    else:
++        flags['lib'] = f'python{version}{sys.abiflags}'
++
++    return flags
++
++
++def get_package_include_path(which_package):
++    print('which_package ', which_package)
++    package_path = find_package(which_package)
++    if package_path is None:
++        return None
++
++    includes = f"{package_path}/include"
++
++    return includes
++
++
++def get_package_qmake_lflags(which_package):
++    package_path = find_package(which_package)
++    if package_path is None:
++        return None
++
++    link = f"-L{package_path}"
++    glob_result = glob.glob(os.path.join(package_path, shared_library_glob_pattern()))
++    for lib in filter_shared_libraries(glob_result):
++        link += ' '
++        link += link_option(lib)
++    return link
++
++
++def get_shared_libraries_data(which_package):
++    package_path = find_package(which_package)
++    if package_path is None:
++        return None
++
++    glob_result = glob.glob(os.path.join(package_path, shared_library_glob_pattern()))
++    filtered_libs = filter_shared_libraries(glob_result)
++    libs = []
++    if sys.platform == 'win32':
++        for lib in filtered_libs:
++            libs.append(os.path.realpath(lib))
++    else:
++        for lib in filtered_libs:
++            libs.append(lib)
++    return libs
++
++
++def get_shared_libraries_qmake(which_package):
++    libs = get_shared_libraries_data(which_package)
++    if libs is None:
++        return None
++
++    if sys.platform == 'win32':
++        if not libs:
++            return ''
++        dlls = ''
++        for lib in libs:
++            dll = os.path.splitext(lib)[0] + '.dll'
++            dlls += dll + ' '
++
++        return dlls
++    else:
++        libs_string = ''
++        for lib in libs:
++            libs_string += lib + ' '
++        return libs_string
++
++
++def get_shared_libraries_cmake(which_package):
++    libs = get_shared_libraries_data(which_package)
++    result = ';'.join(libs)
++    return result
++
++
++print_all = option == "-a"
++for argument, handler, error, _ in options:
++    if option == argument or print_all:
++        handler_result = handler()
++        if handler_result is None:
++            sys.exit(error)
++
++        line = handler_result
++        if print_all:
++            line = f"{argument:<40}: {line}"
++        print(line)
+diff --git a/cmake/shiboken_helper.cmake b/cmake/shiboken_helper.cmake
+index 7624157..ad7561a 100644
+--- a/cmake/shiboken_helper.cmake
++++ b/cmake/shiboken_helper.cmake
+@@ -21,45 +21,99 @@ if(__PYTHON_QT_BINDING_SHIBOKEN_HELPER_INCLUDED)
+ endif()
+ set(__PYTHON_QT_BINDING_SHIBOKEN_HELPER_INCLUDED TRUE)
+ 
++find_package(QT NAMES Qt5 Qt6 REQUIRED)
++
+ # In CMake 3.27 and later, FindPythonInterp and FindPythonLibs are deprecated.
+ # However, Shiboken2 as packaged in Ubuntu 24.04 still use them, so set CMP0148 to
+ # "OLD" to silence this warning.
+ if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.27.0")
+   cmake_policy(SET CMP0148 OLD)
+ endif()
+-find_package(Shiboken2 QUIET)
+-if(Shiboken2_FOUND)
+-  message(STATUS "Found Shiboken2 version ${Shiboken2_VERSION}")
+-  if(NOT ${Shiboken2_VERSION} VERSION_LESS "5.13")
+-    get_property(SHIBOKEN_INCLUDE_DIR TARGET Shiboken2::libshiboken PROPERTY INTERFACE_INCLUDE_DIRECTORIES)
+-    get_property(SHIBOKEN_LIBRARY TARGET Shiboken2::libshiboken PROPERTY LOCATION)
+-    set(SHIBOKEN_BINARY Shiboken2::shiboken2)
++
++if(${QT_VERSION_MAJOR} GREATER "5")
++  # Macro to get various pyside / python include / link flags and paths.
++  # Uses the not entirely supported utils/pyside_config.py file.
++
++    # Use provided python interpreter if given.
++  if(NOT python_interpreter)
++    find_program(python_interpreter "python3")
++    if(NOT python_interpreter)
++        message(FATAL_ERROR
++            "No Python interpreter could be found. Make sure python is in PATH.")
++    endif()
++  endif()
++  message(STATUS "Using python interpreter: ${python_interpreter}")
++
++  macro(pyside_config option output_var)
++      if(${ARGC} GREATER 2)
++          set(is_list ${ARGV2})
++      else()
++          set(is_list "")
++      endif()
++
++      find_package(python_qt_binding REQUIRED)
++      message("Alex " ${python_interpreter} ${python_qt_binding_DIR}/pyside_config.py
++      ${option} )
++
++      execute_process(
++        COMMAND ${python_interpreter} ${python_qt_binding_DIR}/pyside_config.py
++                ${option}
++        OUTPUT_VARIABLE ${output_var}
++        OUTPUT_STRIP_TRAILING_WHITESPACE)
++
++      if ("${${output_var}}" STREQUAL "")
++          message(FATAL_ERROR "Error: Calling pyside_config.py ${option} returned no output.")
++      endif()
++      if(is_list)
++          string (REPLACE " " ";" ${output_var} "${${output_var}}")
++      endif()
++  endmacro()
++
++  pyside_config(--pyside-shared-libraries-cmake pyside6_lib)
++  pyside_config(--pyside-include-path pyside6_includes)
++  pyside_config(--shiboken-module-shared-libraries-cmake shiboken6_lib)
++  pyside_config(--shiboken-generator-include-path shiboken6_includes)
++  pyside_config(--shiboken-generator-path shiboken6_generator_path)
++
++  set(PYSIDE_LIBRARY pyside6_lib)
++  set(PYSIDE_INCLUDE_DIR pyside6_includes)
++  set(SHIBOKEN_LIBRARY shiboken6_lib)
++  set(SHIBOKEN_INCLUDE_DIR shiboken6_includes)
++  set(SHIBOKEN_BINARY "${shiboken6_generator_path}/shiboken6")
++else()
++  find_package(Shiboken2 QUIET)
++  if(Shiboken2_FOUND)
++    message(STATUS "Found Shiboken2 version ${Shiboken2_VERSION}")
++    if(NOT ${Shiboken2_VERSION} VERSION_LESS "5.13")
++      get_property(SHIBOKEN_INCLUDE_DIR TARGET Shiboken2::libshiboken PROPERTY INTERFACE_INCLUDE_DIRECTORIES)
++      get_property(SHIBOKEN_LIBRARY TARGET Shiboken2::libshiboken PROPERTY LOCATION)
++      set(SHIBOKEN_BINARY Shiboken2::shiboken2)
++    endif()
++    message(STATUS "Using SHIBOKEN_INCLUDE_DIR: ${SHIBOKEN_INCLUDE_DIR}")
++    message(STATUS "Using SHIBOKEN_LIBRARY: ${SHIBOKEN_LIBRARY}")
++    message(STATUS "Using SHIBOKEN_BINARY: ${SHIBOKEN_BINARY}")
+   endif()
+-  message(STATUS "Using SHIBOKEN_INCLUDE_DIR: ${SHIBOKEN_INCLUDE_DIR}")
+-  message(STATUS "Using SHIBOKEN_LIBRARY: ${SHIBOKEN_LIBRARY}")
+-  message(STATUS "Using SHIBOKEN_BINARY: ${SHIBOKEN_BINARY}")
+-endif()
+ 
+-find_package(PySide2 QUIET)
+-if(PySide2_FOUND)
+-  message(STATUS "Found PySide2 version ${PySide2_VERSION}")
+-  if(NOT ${PySide2_VERSION} VERSION_LESS "5.13")
+-    get_property(PYSIDE_INCLUDE_DIR TARGET PySide2::pyside2 PROPERTY INTERFACE_INCLUDE_DIRECTORIES)
+-    get_property(PYSIDE_LIBRARY TARGET PySide2::pyside2 PROPERTY LOCATION)
++  find_package(PySide2 QUIET)
++  if(PySide2_FOUND)
++    message(STATUS "Found PySide2 version ${PySide2_VERSION}")
++    if(NOT ${PySide2_VERSION} VERSION_LESS "5.13")
++      get_property(PYSIDE_INCLUDE_DIR TARGET PySide2::pyside2 PROPERTY INTERFACE_INCLUDE_DIRECTORIES)
++      get_property(PYSIDE_LIBRARY TARGET PySide2::pyside2 PROPERTY LOCATION)
++    endif()
++    message(STATUS "Using PYSIDE_INCLUDE_DIR: ${PYSIDE_INCLUDE_DIR}")
++    message(STATUS "Using PYSIDE_LIBRARY: ${PYSIDE_LIBRARY}")
+   endif()
+-  message(STATUS "Using PYSIDE_INCLUDE_DIR: ${PYSIDE_INCLUDE_DIR}")
+-  message(STATUS "Using PYSIDE_LIBRARY: ${PYSIDE_LIBRARY}")
+-endif()
+ 
+-if(Shiboken2_FOUND AND PySide2_FOUND)
+-  message(STATUS "Shiboken binding generator available.")
+-  set(shiboken_helper_FOUND TRUE)
+-else()
+-  message(STATUS "Shiboken binding generator NOT available.")
+-  set(shiboken_helper_NOTFOUND TRUE)
++  if(Shiboken2_FOUND AND PySide2_FOUND)
++    message(STATUS "Shiboken binding generator available.")
++    set(shiboken_helper_FOUND TRUE)
++  else()
++    message(STATUS "Shiboken binding generator NOT available.")
++    set(shiboken_helper_NOTFOUND TRUE)
++  endif()
+ endif()
+ 
+-
+ macro(_shiboken_generator_command VAR GLOBAL TYPESYSTEM INCLUDE_PATH BUILD_DIR)
+   # Add includes from current directory, Qt, PySide and compiler specific dirs
+   get_directory_property(SHIBOKEN_HELPER_INCLUDE_DIRS INCLUDE_DIRECTORIES)
+@@ -78,10 +132,35 @@ macro(_shiboken_generator_command VAR GLOBAL TYPESYSTEM INCLUDE_PATH BUILD_DIR)
+     --enable-pyside-extensions
+     -std=c++17
+     --include-paths=${INCLUDE_PATH_WITH_COLONS}${SHIBOKEN_HELPER_INCLUDE_DIRS_WITH_COLONS}
+-    --typesystem-paths=${PYSIDE_TYPESYSTEMS}
+-    --output-directory=${BUILD_DIR} ${GLOBAL} ${TYPESYSTEM})
++    --typesystem-paths="/usr/local/lib/python3.12/dist-packages/PySide6/typesystems/"
++    --output-directory=${BUILD_DIR} ${GLOBAL} ${TYPESYSTEM}
++    --no-suppress-warnings)
+ endmacro()
+ 
++macro(_shiboken_generator_command6 VAR GLOBAL TYPESYSTEM INCLUDE_PATH BUILD_DIR)
++  # Add includes from current directory, Qt, PySide and compiler specific dirs
++  get_directory_property(SHIBOKEN_HELPER_INCLUDE_DIRS INCLUDE_DIRECTORIES)
++  list(APPEND SHIBOKEN_HELPER_INCLUDE_DIRS
++    ${QT_INCLUDE_DIR}
++    ${PYSIDE_INCLUDE_DIR}
++    ${CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES})
++  # See ticket https://code.ros.org/trac/ros-pkg/ticket/5219
++  set(SHIBOKEN_HELPER_INCLUDE_DIRS_WITH_COLONS "")
++  foreach(dir ${SHIBOKEN_HELPER_INCLUDE_DIRS})
++    set(SHIBOKEN_HELPER_INCLUDE_DIRS_WITH_COLONS "${SHIBOKEN_HELPER_INCLUDE_DIRS_WITH_COLONS}:${dir}")
++  endforeach()
++  string(REPLACE ";" ":" INCLUDE_PATH_WITH_COLONS "${INCLUDE_PATH}")
++  set(${VAR} ${SHIBOKEN_BINARY}
++    --generator-set=shiboken
++    --enable-pyside-extensions
++    -std=c++17
++    --include-paths=${INCLUDE_PATH_WITH_COLONS}${SHIBOKEN_HELPER_INCLUDE_DIRS_WITH_COLONS}
++    --typesystem-paths="/usr/local/lib/python3.12/dist-packages/PySide6/typesystems/"
++    --output-directory=${BUILD_DIR} ${GLOBAL} ${TYPESYSTEM}
++    --enable-parent-ctor-heuristic
++    --enable-return-value-heuristic --use-isnull-as-nb-bool
++    --avoid-protected-hack)
++endmacro()
+ 
+ #
+ # Run the Shiboken generator.
+@@ -115,6 +194,17 @@ function(shiboken_generator PROJECT_NAME GLOBAL TYPESYSTEM WORKING_DIR GENERATED
+   )
+ endfunction()
+ 
++function(shiboken_generator6 PROJECT_NAME GLOBAL TYPESYSTEM WORKING_DIR GENERATED_SRCS HDRS INCLUDE_PATH BUILD_DIR)
++  _shiboken_generator_command6(COMMAND "${GLOBAL}" "${TYPESYSTEM}" "${INCLUDE_PATH}" "${BUILD_DIR}")
++  message("comand ${COMMAND} ")
++  add_custom_command(
++    OUTPUT ${GENERATED_SRCS}
++    COMMAND ${COMMAND}
++    DEPENDS ${GLOBAL} ${TYPESYSTEM} ${HDRS}
++    WORKING_DIRECTORY ${WORKING_DIR}
++    COMMENT "Running Shiboken generator for ${PROJECT_NAME} Python bindings..."
++  )
++endfunction()
+ 
+ #
+ # Add the Shiboken/PySide specific include directories.
+
+From bd88c0d5d51add58e329c40bba20a7b04c3df063 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Alejandro=20Hern=C3=A1ndez=20Cordero?= <ahcorde@gmail.com>
+Date: Wed, 3 Jul 2024 13:48:11 +0200
+Subject: [PATCH 2/3] make linters happy
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Alejandro Hernández Cordero <ahcorde@gmail.com>
+---
+ cmake/pyside_config.py      | 90 ++++++++++++++++++-------------------
+ cmake/shiboken_helper.cmake |  7 +--
+ 2 files changed, 47 insertions(+), 50 deletions(-)
+
+diff --git a/cmake/pyside_config.py b/cmake/pyside_config.py
+index 73342fc..85cfeb9 100755
+--- a/cmake/pyside_config.py
++++ b/cmake/pyside_config.py
+@@ -2,12 +2,12 @@
+ # Copyright (C) 2022 The Qt Company Ltd.
+ # SPDX-License-Identifier: LicenseRef-Qt-Commercial OR BSD-3-Clause
+ 
+-import sysconfig
+ from enum import Enum
+-import glob
++from glob import glob
+ import os
+ import re
+ import sys
++import sysconfig
+ 
+ 
+ PYSIDE = 'pyside6'
+@@ -22,8 +22,8 @@ class Package(Enum):
+ 
+ 
+ generic_error = ('Did you forget to activate your virtualenv? Or perhaps'
+-                 f' you forgot to build / install {PYSIDE_MODULE} into your currently active Python'
+-                 ' environment?')
++                 f' you forgot to build / install {PYSIDE_MODULE} into your currently'
++                 ' active Python environment?')
+ pyside_error = f'Unable to locate {PYSIDE_MODULE}. {generic_error}'
+ shiboken_module_error = f'Unable to locate {SHIBOKEN}-module. {generic_error}'
+ shiboken_generator_error = f'Unable to locate shiboken-generator. {generic_error}'
+@@ -34,57 +34,57 @@ class Package(Enum):
+ options = []
+ 
+ # option, function, error, description
+-options.append(("--shiboken-module-path",
++options.append(('--shiboken-module-path',
+                 lambda: find_shiboken_module(),
+                 shiboken_module_error,
+-                "Print shiboken module location"))
+-options.append(("--shiboken-generator-path",
++                'Print shiboken module location'))
++options.append(('--shiboken-generator-path',
+                 lambda: find_shiboken_generator(),
+                 shiboken_generator_error,
+-                "Print shiboken generator location"))
+-options.append(("--pyside-path", lambda: find_pyside(), pyside_error,
+-                f"Print {PYSIDE_MODULE} location"))
++                'Print shiboken generator location'))
++options.append(('--pyside-path', lambda: find_pyside(), pyside_error,
++                f'Print {PYSIDE_MODULE} location'))
+ 
+-options.append(("--python-include-path",
++options.append(('--python-include-path',
+                 lambda: get_python_include_path(),
+                 python_include_error,
+-                "Print Python include path"))
+-options.append(("--shiboken-generator-include-path",
++                'Print Python include path'))
++options.append(('--shiboken-generator-include-path',
+                 lambda: get_package_include_path(Package.SHIBOKEN_GENERATOR),
+                 pyside_error,
+-                "Print shiboken generator include paths"))
+-options.append(("--pyside-include-path",
++                'Print shiboken generator include paths'))
++options.append(('--pyside-include-path',
+                 lambda: get_package_include_path(Package.PYSIDE_MODULE),
+                 pyside_error,
+-                "Print PySide6 include paths"))
++                'Print PySide6 include paths'))
+ 
+-options.append(("--python-link-flags-qmake", lambda: python_link_flags_qmake(), python_link_error,
+-                "Print python link flags for qmake"))
+-options.append(("--python-link-flags-cmake", lambda: python_link_flags_cmake(), python_link_error,
+-                "Print python link flags for cmake"))
++options.append(('--python-link-flags-qmake', lambda: python_link_flags_qmake(), python_link_error,
++                'Print python link flags for qmake'))
++options.append(('--python-link-flags-cmake', lambda: python_link_flags_cmake(), python_link_error,
++                'Print python link flags for cmake'))
+ 
+-options.append(("--shiboken-module-qmake-lflags",
++options.append(('--shiboken-module-qmake-lflags',
+                 lambda: get_package_qmake_lflags(Package.SHIBOKEN_MODULE), pyside_error,
+-                "Print shiboken6 shared library link flags for qmake"))
+-options.append(("--pyside-qmake-lflags",
++                'Print shiboken6 shared library link flags for qmake'))
++options.append(('--pyside-qmake-lflags',
+                 lambda: get_package_qmake_lflags(Package.PYSIDE_MODULE), pyside_error,
+-                "Print PySide6 shared library link flags for qmake"))
++                'Print PySide6 shared library link flags for qmake'))
+ 
+-options.append(("--shiboken-module-shared-libraries-qmake",
++options.append(('--shiboken-module-shared-libraries-qmake',
+                 lambda: get_shared_libraries_qmake(Package.SHIBOKEN_MODULE), pyside_libs_error,
+                 "Print paths of shiboken shared libraries (.so's, .dylib's, .dll's) for qmake"))
+-options.append(("--shiboken-module-shared-libraries-cmake",
++options.append(('--shiboken-module-shared-libraries-cmake',
+                 lambda: get_shared_libraries_cmake(Package.SHIBOKEN_MODULE), pyside_libs_error,
+                 "Print paths of shiboken shared libraries (.so's, .dylib's, .dll's) for cmake"))
+ 
+-options.append(("--pyside-shared-libraries-qmake",
++options.append(('--pyside-shared-libraries-qmake',
+                 lambda: get_shared_libraries_qmake(Package.PYSIDE_MODULE), pyside_libs_error,
+                 "Print paths of f{PYSIDE_MODULE} shared libraries (.so's, .dylib's, .dll's) "
+-                "for qmake"))
+-options.append(("--pyside-shared-libraries-cmake",
++                'for qmake'))
++options.append(('--pyside-shared-libraries-cmake',
+                 lambda: get_shared_libraries_cmake(Package.PYSIDE_MODULE), pyside_libs_error,
+                 f"Print paths of {PYSIDE_MODULE} shared libraries (.so's, .dylib's, .dll's) "
+-                "for cmake"))
++                'for cmake'))
+ 
+ options_usage = ''
+ for i, (flag, _, _, description) in enumerate(options):
+@@ -130,7 +130,7 @@ def import_suffixes():
+ 
+ def is_debug():
+     debug_suffix = '_d.pyd' if sys.platform == 'win32' else '_d.so'
+-    return any([s.endswith(debug_suffix) for s in import_suffixes()])
++    return any(s.endswith(debug_suffix) for s in import_suffixes())
+ 
+ 
+ def shared_library_glob_pattern():
+@@ -175,7 +175,7 @@ def find_shiboken_module():
+ 
+ 
+ def find_shiboken_generator():
+-    return find_package_path(f"{SHIBOKEN}_generator")
++    return find_package_path(f'{SHIBOKEN}_generator')
+ 
+ 
+ def find_package(which_package):
+@@ -197,7 +197,7 @@ def find_package_path(dir_name):
+     return None
+ 
+ 
+-# Return version as "x.y" (e.g. 3.9, 3.12, etc)
++# Return version as 'x.y' (e.g. 3.9, 3.12, etc)
+ def python_version():
+     return str(sys.version_info[0]) + '.' + str(sys.version_info[1])
+ 
+@@ -210,12 +210,12 @@ def python_link_flags_qmake():
+     flags = python_link_data()
+     if sys.platform == 'win32':
+         libdir = flags['libdir']
+-        # This will add the "~1" shortcut for directories that
++        # This will add the '~1' shortcut for directories that
+         # contain white spaces
+-        # e.g.: "Program Files" to "Progra~1"
+-        for d in libdir.split("\\"):
+-            if " " in d:
+-                libdir = libdir.replace(d, d.split(" ")[0][:-1] + "~1")
++        # e.g.: 'Program Files' to 'Progra~1'
++        for d in libdir.split('\\'):
++            if ' ' in d:
++                libdir = libdir.replace(d, d.split(' ')[0][:-1] + '~1')
+         lib_flags = flags['lib']
+         return f'-L{libdir} -l{lib_flags}'
+     elif sys.platform == 'darwin':
+@@ -241,7 +241,7 @@ def python_link_data():
+     libdir = sysconfig.get_config_var('LIBDIR')
+     if libdir is None:
+         libdir = os.path.abspath(os.path.join(
+-            sysconfig.get_config_var('LIBDEST'), "..", "libs"))
++            sysconfig.get_config_var('LIBDEST'), '..', 'libs'))
+     version = python_version()
+     version_no_dots = version.replace('.', '')
+ 
+@@ -267,7 +267,7 @@ def get_package_include_path(which_package):
+     if package_path is None:
+         return None
+ 
+-    includes = f"{package_path}/include"
++    includes = f'{package_path}/include'
+ 
+     return includes
+ 
+@@ -277,8 +277,8 @@ def get_package_qmake_lflags(which_package):
+     if package_path is None:
+         return None
+ 
+-    link = f"-L{package_path}"
+-    glob_result = glob.glob(os.path.join(package_path, shared_library_glob_pattern()))
++    link = f'-L{package_path}'
++    glob_result = glob(os.path.join(package_path, shared_library_glob_pattern()))
+     for lib in filter_shared_libraries(glob_result):
+         link += ' '
+         link += link_option(lib)
+@@ -290,7 +290,7 @@ def get_shared_libraries_data(which_package):
+     if package_path is None:
+         return None
+ 
+-    glob_result = glob.glob(os.path.join(package_path, shared_library_glob_pattern()))
++    glob_result = glob(os.path.join(package_path, shared_library_glob_pattern()))
+     filtered_libs = filter_shared_libraries(glob_result)
+     libs = []
+     if sys.platform == 'win32':
+@@ -329,7 +329,7 @@ def get_shared_libraries_cmake(which_package):
+     return result
+ 
+ 
+-print_all = option == "-a"
++print_all = option == '-a'
+ for argument, handler, error, _ in options:
+     if option == argument or print_all:
+         handler_result = handler()
+@@ -338,5 +338,5 @@ def get_shared_libraries_cmake(which_package):
+ 
+         line = handler_result
+         if print_all:
+-            line = f"{argument:<40}: {line}"
++            line = f'{argument:<40}: {line}'
+         print(line)
+diff --git a/cmake/shiboken_helper.cmake b/cmake/shiboken_helper.cmake
+index ad7561a..afae499 100644
+--- a/cmake/shiboken_helper.cmake
++++ b/cmake/shiboken_helper.cmake
+@@ -52,20 +52,17 @@ if(${QT_VERSION_MAJOR} GREATER "5")
+       endif()
+ 
+       find_package(python_qt_binding REQUIRED)
+-      message("Alex " ${python_interpreter} ${python_qt_binding_DIR}/pyside_config.py
+-      ${option} )
+-
+       execute_process(
+         COMMAND ${python_interpreter} ${python_qt_binding_DIR}/pyside_config.py
+                 ${option}
+         OUTPUT_VARIABLE ${output_var}
+         OUTPUT_STRIP_TRAILING_WHITESPACE)
+ 
+-      if ("${${output_var}}" STREQUAL "")
++      if("${${output_var}}" STREQUAL "")
+           message(FATAL_ERROR "Error: Calling pyside_config.py ${option} returned no output.")
+       endif()
+       if(is_list)
+-          string (REPLACE " " ";" ${output_var} "${${output_var}}")
++          string(REPLACE " " ";" ${output_var} "${${output_var}}")
+       endif()
+   endmacro()
+ 
+
+From d710e1afb2ac0effed1e8d6ab90eee53354366bb Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Alejandro=20Hern=C3=A1ndez=20Cordero?= <ahcorde@gmail.com>
+Date: Wed, 3 Jul 2024 14:16:36 +0200
+Subject: [PATCH 3/3] Fixes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Alejandro Hernández Cordero <ahcorde@gmail.com>
+---
+ cmake/pyside_config.py      |  1 -
+ cmake/shiboken_helper.cmake | 20 +++++++++++---------
+ 2 files changed, 11 insertions(+), 10 deletions(-)
+
+diff --git a/cmake/pyside_config.py b/cmake/pyside_config.py
+index 85cfeb9..2282e43 100755
+--- a/cmake/pyside_config.py
++++ b/cmake/pyside_config.py
+@@ -262,7 +262,6 @@ def python_link_data():
+ 
+ 
+ def get_package_include_path(which_package):
+-    print('which_package ', which_package)
+     package_path = find_package(which_package)
+     if package_path is None:
+         return None
+diff --git a/cmake/shiboken_helper.cmake b/cmake/shiboken_helper.cmake
+index afae499..b8d6c61 100644
+--- a/cmake/shiboken_helper.cmake
++++ b/cmake/shiboken_helper.cmake
+@@ -72,11 +72,12 @@ if(${QT_VERSION_MAJOR} GREATER "5")
+   pyside_config(--shiboken-generator-include-path shiboken6_includes)
+   pyside_config(--shiboken-generator-path shiboken6_generator_path)
+ 
+-  set(PYSIDE_LIBRARY pyside6_lib)
+-  set(PYSIDE_INCLUDE_DIR pyside6_includes)
+-  set(SHIBOKEN_LIBRARY shiboken6_lib)
+-  set(SHIBOKEN_INCLUDE_DIR shiboken6_includes)
++  set(PYSIDE_LIBRARY ${pyside6_lib})
++  set(PYSIDE_INCLUDE_DIR ${pyside6_includes})
++  set(SHIBOKEN_LIBRARY ${shiboken6_lib})
++  set(SHIBOKEN_INCLUDE_DIR ${shiboken6_includes};${shiboken6_generator_path}/include)
+   set(SHIBOKEN_BINARY "${shiboken6_generator_path}/shiboken6")
++  set(shiboken_helper_FOUND TRUE)
+ else()
+   find_package(Shiboken2 QUIET)
+   if(Shiboken2_FOUND)
+@@ -86,9 +87,6 @@ else()
+       get_property(SHIBOKEN_LIBRARY TARGET Shiboken2::libshiboken PROPERTY LOCATION)
+       set(SHIBOKEN_BINARY Shiboken2::shiboken2)
+     endif()
+-    message(STATUS "Using SHIBOKEN_INCLUDE_DIR: ${SHIBOKEN_INCLUDE_DIR}")
+-    message(STATUS "Using SHIBOKEN_LIBRARY: ${SHIBOKEN_LIBRARY}")
+-    message(STATUS "Using SHIBOKEN_BINARY: ${SHIBOKEN_BINARY}")
+   endif()
+ 
+   find_package(PySide2 QUIET)
+@@ -98,8 +96,6 @@ else()
+       get_property(PYSIDE_INCLUDE_DIR TARGET PySide2::pyside2 PROPERTY INTERFACE_INCLUDE_DIRECTORIES)
+       get_property(PYSIDE_LIBRARY TARGET PySide2::pyside2 PROPERTY LOCATION)
+     endif()
+-    message(STATUS "Using PYSIDE_INCLUDE_DIR: ${PYSIDE_INCLUDE_DIR}")
+-    message(STATUS "Using PYSIDE_LIBRARY: ${PYSIDE_LIBRARY}")
+   endif()
+ 
+   if(Shiboken2_FOUND AND PySide2_FOUND)
+@@ -111,6 +107,12 @@ else()
+   endif()
+ endif()
+ 
++message(STATUS "Using SHIBOKEN_INCLUDE_DIR: ${SHIBOKEN_INCLUDE_DIR}")
++message(STATUS "Using SHIBOKEN_LIBRARY: ${SHIBOKEN_LIBRARY}")
++message(STATUS "Using SHIBOKEN_BINARY: ${SHIBOKEN_BINARY}")
++message(STATUS "Using PYSIDE_INCLUDE_DIR: ${PYSIDE_INCLUDE_DIR}")
++message(STATUS "Using PYSIDE_LIBRARY: ${PYSIDE_LIBRARY}")
++
+ macro(_shiboken_generator_command VAR GLOBAL TYPESYSTEM INCLUDE_PATH BUILD_DIR)
+   # Add includes from current directory, Qt, PySide and compiler specific dirs
+   get_directory_property(SHIBOKEN_HELPER_INCLUDE_DIRS INCLUDE_DIRECTORIES)
